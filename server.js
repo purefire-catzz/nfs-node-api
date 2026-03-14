@@ -1,72 +1,91 @@
-/**
- * NOVI-SPREAD: Regional Edge Cache Node
- * Deployment: Deploy to EU and US-Virginia nodes
- */
+const http = require('http');
 
-// Global cache survives between function executions if the isolate stays warm
+// Global RAM Cache
 const MEMORY_CACHE = new Map();
-const CACHE_TTL = 30 * 60 * 1000; // 30 Minutes in milliseconds
+const CACHE_TTL = 30 * 60 * 1000; // 30 Minutes
 const ORIGIN_BASE = "https://storage.novisurf.top";
+const PORT = process.env.PORT || 8080;
 
-export default async function handler(request) {
-  const url = new URL(request.url);
-  const cacheKey = url.pathname; // This gets /<bucketid>/<slug>
+const server = http.createServer(async (req, res) => {
+  const cacheKey = req.url;
 
-  // 1. Check Memory Cache
-  if (MEMORY_CACHE.has(cacheKey)) {
-    const cached = MEMORY_CACHE.get(cacheKey);
-    const isExpired = Date.now() - cached.timestamp > CACHE_TTL;
-
-    if (!isExpired) {
-      console.log(`[CACHE_HIT]: ${cacheKey}`);
-      return new Response(cached.body, {
-        headers: {
-          ...cached.headers,
-          "X-Novi-Cache": "HIT-RAM",
-          "X-Novi-Region": "US-VA-1" // Change this per node (EU-1, etc)
-        }
-      });
-    } else {
-      MEMORY_CACHE.delete(cacheKey); // Clean up expired
-    }
+  // 1. AWS App Runner Health Check
+  if (cacheKey === "/health" || cacheKey === "/") {
+    res.writeHead(200, { 'Content-Type': 'text/plain' });
+    return res.end("OK");
   }
 
-  // 2. Cache Miss: Proxy to Main Origin
-  console.log(`[CACHE_MISS]: Fetching from origin for ${cacheKey}`);
+  // 2. RAM Cache Check
+  if (MEMORY_CACHE.has(cacheKey)) {
+    const cached = MEMORY_CACHE.get(cacheKey);
+    if (Date.now() - cached.timestamp < CACHE_TTL) {
+      console.log(`[HIT] ${cacheKey}`);
+      // Apply all stored origin headers
+      res.writeHead(200, { 
+        ...cached.headers, 
+        "X-Novi-Cache": "HIT-RAM",
+        "X-Novi-Node": "US-VA-1" 
+      });
+      return res.end(cached.body);
+    }
+    MEMORY_CACHE.delete(cacheKey);
+  }
+
+  // 3. Proxy to Origin
   try {
-    const originResponse = await fetch(`${ORIGIN_BASE}${cacheKey}`, {
+    console.log(`[MISS] Fetching: ${ORIGIN_BASE}${cacheKey}`);
+    const originRes = await fetch(`${ORIGIN_BASE}${cacheKey}`, {
       headers: { "User-Agent": "Novi-Spread-Node/1.0" }
     });
 
-    if (!originResponse.ok) {
-      return new Response("Origin Error", { status: originResponse.status });
+    if (!originRes.ok) {
+      res.writeHead(originRes.status);
+      return res.end(`Origin Error: ${originRes.statusText}`);
     }
 
-    // We need the buffer to store it in memory
-    const buffer = await originResponse.arrayBuffer();
-    
-    // Extract useful headers to store
-    const responseHeaders = {
-      "Content-Type": originResponse.headers.get("Content-Type") || "application/octet-stream",
-      "Cache-Control": "public, max-age=3600",
-    };
+    // Capture the data as a Buffer
+    const arrayBuffer = await originRes.arrayBuffer();
+    const buffer = Buffer.from(arrayBuffer);
 
-    // 3. Save to Memory
+    // DYNAMIC HEADER CAPTURE
+    // We pick the critical ones to mirror exactly
+    const headersToMirror = [
+      'content-type',
+      'content-length',
+      'cache-control',
+      'last-modified',
+      'etag'
+    ];
+
+    const responseHeaders = {};
+    headersToMirror.forEach(h => {
+      const val = originRes.headers.get(h);
+      if (val) responseHeaders[h] = val;
+    });
+
+    // 4. Save to Memory
     MEMORY_CACHE.set(cacheKey, {
       body: buffer,
       headers: responseHeaders,
       timestamp: Date.now()
     });
 
-    return new Response(buffer, {
-      headers: {
-        ...responseHeaders,
-        "X-Novi-Cache": "MISS",
-        "X-Novi-Region": "US-VA-1"
-      }
+    // 5. Send Response
+    res.writeHead(200, { 
+      ...responseHeaders, 
+      "X-Novi-Cache": "MISS",
+      "X-Novi-Node": "US-VA-1"
     });
+    res.end(buffer);
 
   } catch (err) {
-    return new Response(`Gateway Error: ${err.message}`, { status: 502 });
+    console.error(`Proxy Failure: ${err.message}`);
+    res.writeHead(502);
+    res.end("Gateway Error");
   }
-}
+});
+
+// Start the server and bind to 0.0.0.0
+server.listen(PORT, '0.0.0.0', () => {
+  console.log(`🚀 Novi-Spread Regional Node Live on port ${PORT}`);
+});
