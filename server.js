@@ -1,149 +1,144 @@
-const http = require('http');
+"use strict";
 
-// --- CONFIGURATION ---
-const MEMORY_CACHE = new Map();
-const CACHE_TTL = 30 * 60 * 1000; // 30 Minutes
-const ORIGIN_BASE = "https://storage.novisurf.top";
+const http = require('http');
+const https = require('https');
+
+// --- 1. CONFIGURATION ---
 const PORT = process.env.PORT || 8080;
+const NODE_NAME = process.env.NODE_NAME || "SYD-NODE-01";
 const INTERNAL_AUTH_TOKEN = process.env.INTERNAL_AUTH_TOKEN || "change_me_immediately";
-const MAX_MEMORY_ITEMS = 5000; // Safety limit to trigger auto-eviction
+const ORIGIN_BASE = "https://storage.novisurf.top";
+
+const CACHE_TTL = 30 * 60 * 1000; // 30 mins
+const MAX_MEMORY_ITEMS = 5000;
+const MEMORY_CACHE = new Map();
+
+// --- 2. OPTIMIZATION: CONNECTION POOLING ---
+// This keeps the "pipe" to your origin open. 
+// Prevents the 100ms handshaking penalty on every MISS.
+const originAgent = new https.Agent({
+  keepAlive: true,
+  maxSockets: 100,
+  timeout: 60000
+});
 
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, `http://${req.headers.host}`);
   const cacheKey = url.pathname;
 
-  // 1. AWS App Runner Health Check
-  if (cacheKey === "/health" || cacheKey === "/") {
+  // --- 3. HEALTH & ADMIN ROUTES ---
+  if (cacheKey === "/" || cacheKey === "/health") {
     res.writeHead(200, { 'Content-Type': 'text/plain' });
-    return res.end("OK");
+    return res.end(`Node ${NODE_NAME} is Online`);
   }
 
-  // --- ADMIN ROUTES (Purge & Evict) ---
+  // --- 4. ADMIN: PURGE LOGIC ---
   const authHeader = req.headers['x-novi-auth'];
-  
-  // A. NUKE: Purge All
-  if (cacheKey === "/purge/all") {
+  if (cacheKey.startsWith("/purge") || cacheKey.startsWith("/evict")) {
     if (authHeader !== INTERNAL_AUTH_TOKEN) {
       res.writeHead(401); return res.end("Unauthorized");
     }
-    MEMORY_CACHE.clear();
-    console.log("!!! CACHE NUKED: /purge/all executed");
-    res.writeHead(200); return res.end("Cache Cleared Successfully");
-  }
 
-  // B. BUCKET PURGE: /purge/:id (Clears all keys starting with /bucketid/)
-  if (cacheKey.startsWith("/purge/")) {
-    if (authHeader !== INTERNAL_AUTH_TOKEN) {
-      res.writeHead(401); return res.end("Unauthorized");
+    if (cacheKey === "/purge/all") {
+      MEMORY_CACHE.clear();
+      return res.end("Nuked");
     }
-    const bucketId = cacheKey.split("/")[2]; // Get :id
-    let count = 0;
-    for (const [key] of MEMORY_CACHE) {
-      if (key.startsWith(`/${bucketId}/`)) {
-        MEMORY_CACHE.delete(key);
-        count++;
+
+    if (cacheKey.startsWith("/purge/")) {
+      const bucket = cacheKey.split("/")[2];
+      let count = 0;
+      for (const [key] of MEMORY_CACHE) {
+        if (key.startsWith(`/${bucket}/`)) { MEMORY_CACHE.delete(key); count++; }
       }
+      return res.end(`Purged ${count}`);
     }
-    console.log(`[PURGE] Bucket: ${bucketId} | Items Removed: ${count}`);
-    res.writeHead(200); return res.end(`Purged ${count} items from bucket ${bucketId}`);
   }
 
-  // C. SELECTIVE EVICT: /evict/:bucketid?key=filename.ext
-  if (cacheKey.startsWith("/evict/")) {
-    if (authHeader !== INTERNAL_AUTH_TOKEN) {
-      res.writeHead(401); return res.end("Unauthorized");
-    }
-    const bucketId = cacheKey.split("/")[2];
-    const fileName = url.searchParams.get("key");
-    const targetKey = `/${bucketId}/${fileName}`;
-    
-    if (MEMORY_CACHE.delete(targetKey)) {
-      console.log(`[EVICT] Single Key: ${targetKey}`);
-      res.writeHead(200); return res.end(`Evicted ${targetKey}`);
-    }
-    res.writeHead(404); return res.end("Key not found in cache");
-  }
-
-  // 2. RAM CACHE CHECK (Standard Request)
+  // --- 5. THE CACHE ENGINE (LRU Strategy) ---
   if (MEMORY_CACHE.has(cacheKey)) {
     const cached = MEMORY_CACHE.get(cacheKey);
+    
+    // Check Expiration
     if (Date.now() - cached.timestamp < CACHE_TTL) {
-      console.log(`[HIT] ${cacheKey}`);
-      
-      // Update access order for LRU logic (Move to end of Map)
+      // Refresh position in Map (Least Recently Used logic)
       MEMORY_CACHE.delete(cacheKey);
       MEMORY_CACHE.set(cacheKey, cached);
 
-      res.writeHead(200, { 
-        ...cached.headers, 
+      res.writeHead(200, {
+        ...cached.headers,
         "X-Novi-Cache": "HIT-RAM",
-        "X-Novi-Node": process.env.NODE_NAME || "US-VA-1" 
+        "X-Novi-Node": NODE_NAME,
+        "Access-Control-Allow-Origin": "*" // Prevent CORS issues
       });
       return res.end(cached.body);
     }
     MEMORY_CACHE.delete(cacheKey);
   }
 
-  // 3. PROXY TO ORIGIN
+  // --- 6. ORIGIN PROXY (With Physics Optimization) ---
   try {
-    console.log(`[MISS] Fetching: ${ORIGIN_BASE}${cacheKey}`);
-    const originRes = await fetch(`${ORIGIN_BASE}${cacheKey}`, {
-      headers: { "User-Agent": "Novi-Spread-Node/1.0" }
+    const originResponse = await fetch(`${ORIGIN_BASE}${cacheKey}`, {
+      method: 'GET',
+      headers: { 
+        "User-Agent": `Novi-Spread/${NODE_NAME}`,
+        "Connection": "keep-alive"
+      },
+      agent: originAgent
     });
 
-    if (!originRes.ok) {
-      res.writeHead(originRes.status);
-      return res.end(`Origin Error: ${originRes.statusText}`);
+    if (!originResponse.ok) {
+      res.writeHead(originResponse.status);
+      return res.end();
     }
 
-    const arrayBuffer = await originRes.arrayBuffer();
+    // CRITICAL: Convert streaming response to Buffer safely
+    const arrayBuffer = await originResponse.arrayBuffer();
     const buffer = Buffer.from(arrayBuffer);
 
-    const headersToMirror = [
-      'content-type',
-      'content-length',
-      'cache-control',
-      'last-modified',
-      'etag'
-    ];
+    // --- 7. HEADER CLEANING (Fixes the Sydney MISS loop) ---
+    // We strip headers that prevent Cloudflare from caching (like Vary: Cookie)
+    // We force a public Cache-Control so the Edge stays primed.
+    const cleanHeaders = {
+      "Content-Type": originResponse.headers.get("content-type") || "application/octet-stream",
+      "Content-Length": buffer.length,
+      "Cache-Control": "public, max-age=3600, s-maxage=3600", // Force 1hr Edge Cache
+      "ETag": originResponse.headers.get("etag"),
+      "Last-Modified": originResponse.headers.get("last-modified"),
+      "Access-Control-Allow-Origin": "*",
+      "Vary": "Accept-Encoding" // Remove 'Cookie' or 'User-Agent' from Vary
+    };
 
-    const responseHeaders = {};
-    headersToMirror.forEach(h => {
-      const val = originRes.headers.get(h);
-      if (val) responseHeaders[h] = val;
-    });
-
-    // 4. AUTO-EVICT LOGIC (LRU Strategy)
-    // Map in Node.js maintains insertion order. 
-    // The first items in the Map are the oldest/least recently used.
+    // --- 8. MEMORY GUARD (Prevent OOM Crashes) ---
     if (MEMORY_CACHE.size >= MAX_MEMORY_ITEMS) {
       const oldestKey = MEMORY_CACHE.keys().next().value;
-      console.log(`[AUTO-EVICT] Memory pressure: Removing ${oldestKey}`);
       MEMORY_CACHE.delete(oldestKey);
     }
 
-    // 5. SAVE TO MEMORY
+    // Store in RAM
     MEMORY_CACHE.set(cacheKey, {
       body: buffer,
-      headers: responseHeaders,
+      headers: cleanHeaders,
       timestamp: Date.now()
     });
 
-    // 6. SEND RESPONSE
-    res.writeHead(200, { 
-      ...responseHeaders, 
+    // --- 9. FINAL RESPONSE ---
+    res.writeHead(200, {
+      ...cleanHeaders,
       "X-Novi-Cache": "MISS",
-      "X-Novi-Node": process.env.NODE_NAME || "US-VA-1"
+      "X-Novi-Node": NODE_NAME
     });
     res.end(buffer);
 
   } catch (err) {
-    console.error(`Proxy Failure: ${err.message}`);
+    console.error(`[ERROR] Proxy Failed: ${err.message}`);
     res.writeHead(502);
-    res.end("Gateway Error");
+    res.end("Origin Gateway Error");
   }
 });
 
+// Start Server
 server.listen(PORT, '0.0.0.0', () => {
-  console.log(`🚀 Novi-Spread Node Active | Port ${PORT} | Max Items: ${MAX_MEMORY_ITEMS}`);
+  console.log(`--- NOVI SPREAD NODE ACTIVE ---`);
+  console.log(`Node: ${NODE_NAME} | Port: ${PORT}`);
+  console.log(`Max Items: ${MAX_MEMORY_ITEMS} | TTL: 30m`);
 });
