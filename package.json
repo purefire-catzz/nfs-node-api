@@ -1,0 +1,12 @@
+{
+  "name": "nfs-node-api",
+  "version": "1.0.0",
+  "description": "Novi-Spread Regional Node",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "node-fetch": "^3.3.2"
+  }
+}
