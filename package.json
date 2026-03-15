@@ -1,12 +1,15 @@
 {
-  "name": "nfs-node-api",
-  "version": "1.0.0",
-  "description": "Novi-Spread Regional Node",
-  "main": "server.js",
+  "name": "novisurf-spread-node",
+  "version": "2.0.0",
+  "description": "Novisurf edge PoP — tiered cache, peer mesh, undici pooling",
+  "main": "spread-node.js",
   "scripts": {
-    "start": "node server.js"
+    "start": "node spread-node.js"
   },
   "dependencies": {
-    "node-fetch": "^3.3.2"
+    "undici": "^6.19.2"
+  },
+  "engines": {
+    "node": ">=18.0.0"
   }
 }
